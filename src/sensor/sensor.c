@@ -699,11 +699,12 @@ int sensor_init(void)
 	}
 	sensor_imu->shutdown(); // TODO: is this needed?
 
-	// Clock already enabled during sensor scan, just ensure it's still on
 	float clock_actual_rate = 0;
 #if CONFIG_USE_SENSOR_CLOCK
-	set_sensor_clock(true, 32768, &clock_actual_rate); // ensure clock source is still enabled
+	set_sensor_clock(true, 32768, &clock_actual_rate); // enable the clock source for IMU if present
 #endif
+	if (clock_actual_rate != 0)
+		LOG_INF("Sensor clock rate: %.2fHz", (double)clock_actual_rate);
 
 	// wait for sensor register reset // TODO: is this needed?
 	k_usleep(250);
