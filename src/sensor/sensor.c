@@ -1088,7 +1088,7 @@ void sensor_loop(void)
 
 				// Also check if expected number of timesteps when using FIFO threshold, if FIFO threshold is being used
 				if (sensor_fifo_threshold && processed_timesteps && processed_timesteps != sensor_fifo_threshold) {
-					LOG_WRN(
+					LOG_DBG(
 						"Expected %d timestep%s, got %d",
 						sensor_fifo_threshold,
 						sensor_fifo_threshold == 1 ? "" : "s",
@@ -1260,8 +1260,9 @@ void sensor_loop(void)
 					}
 #endif
 					// Handle magnetometer calibration
-					if (mag_available && mag_enabled && last_sensor_mode == SENSOR_SENSOR_MODE_LOW_POWER
-						&& sensor_mode == SENSOR_SENSOR_MODE_LOW_POWER) {
+					if (mag_available && mag_enabled && ((last_sensor_mode == SENSOR_SENSOR_MODE_LOW_POWER
+						&& sensor_mode == SENSOR_SENSOR_MODE_LOW_POWER) || (last_sensor_mode == SENSOR_SENSOR_MODE_LOW_POWER_2
+						&& sensor_mode == SENSOR_SENSOR_MODE_LOW_POWER_2))) {
 						sensor_request_calibration_mag();
 					}
 
@@ -1325,7 +1326,7 @@ void sensor_loop(void)
 					k_msleep(sensor_update_time_ms + 10); // will be resumed by interrupt // TODO: dont use hard timeout
 					if (main_wfi)                         // timeout
 					{
-						LOG_WRN("Sensor interrupt timeout");
+						LOG_DBG("Sensor interrupt timeout");
 						main_wfi = false;
 					}
 				} else // if signal was sent during processing, loop immediately to catch up
