@@ -27,6 +27,7 @@
 #include "system/test_mode.h"
 #include "system/watchdog.h"
 #include "system/esb_ota.h"
+#include "system/power.h"
 #include "connection.h"
 #include "zephyr/sys/byteorder.h"
 #include "zephyr/sys/time_units.h"
@@ -120,6 +121,7 @@ static uint8_t ping_history_idx = 0;
 
 static uint8_t received_remote_command = ESB_PONG_FLAG_NORMAL;
 static uint8_t acked_remote_command = ESB_PONG_FLAG_NORMAL;
+static atomic_t wireless_wake_confirmed = ATOMIC_INIT(0);
 static int64_t remote_command_receive_time = 0;
 static uint32_t received_channel_value = 0; // Store channel value from PONG data[8-11]
 static float received_sens_data[3] = {0};   // Store sensitivity data
@@ -142,6 +144,12 @@ static void esb_remote_cmd_shutdown(void)
 {
 	LOG_WRN("Executing remote command: SHUTDOWN");
 	sys_command_shutdown();
+}
+
+static void esb_remote_cmd_standby(void)
+{
+	LOG_INF("Executing remote command: STANDBY");
+	sys_request_wireless_standby();
 }
 
 static void esb_remote_cmd_calibrate(void)
@@ -473,6 +481,7 @@ static void esb_remote_cmd_ota_unsuppress(void)
 
 static const struct esb_remote_cmd esb_remote_cmds[] = {
 	{ESB_PONG_FLAG_SHUTDOWN, "SHUTDOWN", esb_remote_cmd_shutdown},
+	{ESB_PONG_FLAG_STANDBY, "STANDBY", esb_remote_cmd_standby},
 	{ESB_PONG_FLAG_CALIBRATE, "CALIBRATE", esb_remote_cmd_calibrate},
 	{ESB_PONG_FLAG_SIX_SIDE_CAL, "SIX_SIDE_CAL", esb_remote_cmd_six_side_cal},
 	{ESB_PONG_FLAG_MEOW, "MEOW", esb_remote_cmd_meow},
@@ -483,6 +492,7 @@ static const struct esb_remote_cmd esb_remote_cmds[] = {
 	{ESB_PONG_FLAG_MAG_OFF, "MAG_OFF", esb_remote_cmd_mag_off},
 	{ESB_PONG_FLAG_MAG_AUTO_ON, "MAG_AUTO_ON", esb_remote_cmd_mag_auto_on},
 	{ESB_PONG_FLAG_MAG_AUTO_OFF, "MAG_AUTO_OFF", esb_remote_cmd_mag_auto_off},
+	{ESB_PONG_FLAG_WAKE, "WAKE", NULL},
 	{ESB_PONG_FLAG_REBOOT, "REBOOT", esb_remote_cmd_reboot},
 	{ESB_PONG_FLAG_CLEAR, "CLEAR", esb_remote_cmd_clear},
 	{ESB_PONG_FLAG_DFU, "DFU", esb_remote_cmd_dfu},
@@ -1290,6 +1300,11 @@ void event_handler(struct esb_evt const *event)
 							// (but skip re-accepting the same command repeatedly)
 							received_remote_command = pong_flags;
 							remote_command_receive_time = k_uptime_get();
+							if (pong_flags == ESB_PONG_FLAG_WAKE && sys_wireless_standby_active()) {
+								/* Echo WAKE immediately; reboot only after receiver confirms the echo. */
+								acked_remote_command = ESB_PONG_FLAG_WAKE;
+								connection_request_ping_now();
+							}
 
 							// For SET_CHANNEL command, extract channel value from data[8-11]
 							if (pong_flags == ESB_PONG_FLAG_SET_CHANNEL) {
@@ -1323,10 +1338,20 @@ void event_handler(struct esb_evt const *event)
 									"will execute in 1500ms"
 								);
 							}
+						} else if (pong_flags == ESB_PONG_FLAG_WAKE
+							   && acked_remote_command == ESB_PONG_FLAG_WAKE
+							   && sys_wireless_standby_active()) {
+							/* The receiver clears its command after ACK construction; poll once more for NORMAL. */
+							connection_request_ping_now();
 						}
 					} else {
 						// received NORMAL flag, indicates the receiver has confirmed our echo
-						if (acked_remote_command != ESB_PONG_FLAG_NORMAL) {
+						if (acked_remote_command == ESB_PONG_FLAG_WAKE) {
+							atomic_set(&wireless_wake_confirmed, 1);
+							received_remote_command = ESB_PONG_FLAG_NORMAL;
+							acked_remote_command = ESB_PONG_FLAG_NORMAL;
+							remote_command_receive_time = 0;
+						} else if (acked_remote_command != ESB_PONG_FLAG_NORMAL) {
 							LOG_DBG("Receiver confirmed command 0x%02X, resetting state", acked_remote_command);
 							received_remote_command = ESB_PONG_FLAG_NORMAL;
 							acked_remote_command = ESB_PONG_FLAG_NORMAL;
@@ -2049,7 +2074,7 @@ static void esb_thread(void)
 #endif
 				set_status(SYS_STATUS_CONNECTION_ERROR, true);
 #if USER_SHUTDOWN_ENABLED
-			if (!shutdown_requested && connection_error_start_time > 0
+			if (!sys_wireless_standby_active() && !shutdown_requested && connection_error_start_time > 0
 				&& !connection_get_ota_suppressed()
 				&& k_uptime_get() - connection_error_start_time
 					   > CONFIG_CONNECTION_TIMEOUT_DELAY && get_status(SYS_STATUS_CALIBRATION_RUNNING) == false) // shutdown if receiver is not detected and not in calibrating
@@ -2062,12 +2087,16 @@ static void esb_thread(void)
 		}
 		int64_t now_idle = k_uptime_get();
 
+		if (atomic_cas(&wireless_wake_confirmed, 1, 0)) {
+			sys_request_wireless_wake();
+		}
+
 		if (received_remote_command != ESB_PONG_FLAG_NORMAL && received_remote_command != acked_remote_command
 			&& remote_command_receive_time > 0) {
 			/* OTA commands (0x30-0x33) bypass the safety delay since they are
 			 * time-sensitive and not destructive like SHUTDOWN/CALIBRATE. */
 			bool is_ota_cmd = (received_remote_command >= ESB_PONG_FLAG_OTA_QUERY_INFO &&
-					   received_remote_command <= ESB_PONG_FLAG_OTA_UNSUPPRESS);
+						   received_remote_command <= ESB_PONG_FLAG_OTA_UNSUPPRESS);
 			if (is_ota_cmd || now_idle - remote_command_receive_time >= REMOTE_COMMAND_DELAY_MS) {
 				esb_remote_command_execute(received_remote_command);
 
@@ -2099,6 +2128,6 @@ static void esb_thread(void)
 		/* Feed watchdog at end of each loop iteration */
 		watchdog_feed(WDT_CHANNEL_ESB);
 
-		k_msleep(100);
+		k_msleep(sys_wireless_standby_active() ? 250 : 100);
 	}
 }

@@ -21,6 +21,7 @@
 #include <hal/nrf_spim.h>
 #include <hal/nrf_twim.h>
 #include <zephyr/drivers/clock_control/nrf_clock_control.h>
+#include <zephyr/sys/atomic.h>
 #include <stdint.h>
 
 #include "power.h"
@@ -47,6 +48,10 @@ LOG_MODULE_REGISTER(power, LOG_LEVEL_INF);
 static bool sys_WOM(bool force);
 static bool sys_system_off(void);
 static void sys_system_reboot(void);
+static bool sys_wireless_standby(void);
+static void sys_wireless_wake(void);
+
+static atomic_t wireless_standby = ATOMIC_INIT(0);
 
 enum sys_power_request {
 	SYS_POWER_REQ_NONE = 0,
@@ -54,6 +59,8 @@ enum sys_power_request {
 	SYS_POWER_REQ_WOM_FORCE = 2,
 	SYS_POWER_REQ_SYSTEM_OFF = 3,
 	SYS_POWER_REQ_REBOOT = 4,
+	SYS_POWER_REQ_WIRELESS_STANDBY = 5,
+	SYS_POWER_REQ_WIRELESS_WAKE = 6,
 };
 
 static int sys_power_state_request(enum sys_power_request id);
@@ -315,6 +322,57 @@ void sys_request_system_reboot(bool immediate)
 	sys_power_state_request(SYS_POWER_REQ_REBOOT);
 }
 
+bool sys_wireless_standby_active(void)
+{
+	return atomic_get(&wireless_standby) != 0;
+}
+
+void sys_request_wireless_standby(void)
+{
+	sys_power_state_request(SYS_POWER_REQ_WIRELESS_STANDBY);
+}
+
+void sys_request_wireless_wake(void)
+{
+	sys_power_state_request(SYS_POWER_REQ_WIRELESS_WAKE);
+}
+
+/* Returns true when the request is consumed; false retries once OTA/calibration ends. */
+static bool sys_wireless_standby(void)
+{
+	if (esb_ota_is_active() || connection_get_ota_suppressed()
+		|| get_status(SYS_STATUS_CALIBRATION_RUNNING)) {
+		LOG_INF("Wireless standby blocked by OTA or calibration");
+		return false;
+	}
+
+	LOG_INF("Entering wireless standby");
+	main_imu_suspend();
+	sensor_shutdown();
+	set_led(SYS_LED_PATTERN_OFF_FORCE, SYS_LED_PRIORITY_HIGHEST);
+
+	/* Prevent the unpowered IMU/MAG rail being back-powered through SPI/I2C. */
+	sys_disconnect_interface_pins();
+#if CONFIG_DISABLE_SENSOR_GPIOS_ON_SHUTDOWN
+	disconnect_sensor_pins();
+#endif
+	atomic_set(&wireless_standby, 1);
+	return true;
+}
+
+static void sys_wireless_wake(void)
+{
+	LOG_INF("Leaving wireless standby");
+#if PWR_EXISTS
+	gpio_pin_configure_dt(&pwr, GPIO_OUTPUT_ACTIVE);
+	gpio_pin_set_dt(&pwr, 1);
+	k_msleep(5);
+#endif
+	atomic_set(&wireless_standby, 0);
+	/* Reboot instead of resuming: the IMU and magnetometer lost all register state. */
+	sys_system_reboot();
+}
+
 /* Returns true when the power request is consumed; false to keep it queued. */
 static bool sys_WOM(bool force) // TODO: if IMU interrupt does not exist what does the system do?
 {
@@ -556,6 +614,12 @@ static void power_thread(void)
 		case SYS_POWER_REQ_REBOOT:
 			sys_system_reboot();
 			break;
+		case SYS_POWER_REQ_WIRELESS_STANDBY:
+			consumed = sys_wireless_standby();
+			break;
+		case SYS_POWER_REQ_WIRELESS_WAKE:
+			sys_wireless_wake();
+			break;
 		case SYS_POWER_REQ_NONE:
 		default:
 			break;
@@ -636,21 +700,26 @@ static void power_thread(void)
 			battery_mV
 		);
 
-		if (charging)
-			set_led(SYS_LED_PATTERN_PULSE_PERSIST, SYS_LED_PRIORITY_SYSTEM);
-		else if (charged)
-			set_led(SYS_LED_PATTERN_ON_PERSIST, SYS_LED_PRIORITY_SYSTEM);
-		else if (plugged || usb_plugged)
-			set_led(SYS_LED_PATTERN_PULSE_PERSIST, SYS_LED_PRIORITY_SYSTEM);
-		else if (power_battery_is_low())
-			set_led(SYS_LED_PATTERN_LONG_PERSIST, SYS_LED_PRIORITY_SYSTEM);
-		else
-			set_led(SYS_LED_PATTERN_ACTIVE_PERSIST, SYS_LED_PRIORITY_SYSTEM);
-//			set_led(SYS_LED_PATTERN_OFF, SYS_LED_PRIORITY_SYSTEM);
+		if (!sys_wireless_standby_active()) {
+			if (charging)
+				set_led(SYS_LED_PATTERN_PULSE_PERSIST, SYS_LED_PRIORITY_SYSTEM);
+			else if (charged)
+				set_led(SYS_LED_PATTERN_ON_PERSIST, SYS_LED_PRIORITY_SYSTEM);
+			else if (plugged || usb_plugged)
+				set_led(SYS_LED_PATTERN_PULSE_PERSIST, SYS_LED_PRIORITY_SYSTEM);
+			else if (power_battery_is_low())
+				set_led(SYS_LED_PATTERN_LONG_PERSIST, SYS_LED_PRIORITY_SYSTEM);
+			else
+				set_led(SYS_LED_PATTERN_ACTIVE_PERSIST, SYS_LED_PRIORITY_SYSTEM);
+		}
 
 		/* Feed watchdog at end of each loop iteration */
 		watchdog_feed(WDT_CHANNEL_POWER);
 
-		(void)k_sem_take(&power_wake_sem, K_MSEC(100));
+		if (sys_wireless_standby_active()) {
+			(void)k_sem_take(&power_wake_sem, K_SECONDS(3));
+		} else {
+			(void)k_sem_take(&power_wake_sem, K_MSEC(100));
+		}
 	}
 }

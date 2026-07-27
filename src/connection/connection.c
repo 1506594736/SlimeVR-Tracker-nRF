@@ -34,6 +34,7 @@
 #include "system/watchdog.h"
 #include "system/test_mode.h"
 #include "system/esb_ota.h"
+#include "system/power.h"
 
 #include <math.h>
 #include <stdbool.h>
@@ -103,8 +104,10 @@ static bool connection_sensor_get_precise_quat(void)
 static uint8_t packet_sequence = 0;
 static int64_t last_ping_time = 0;
 static uint32_t ping_interval_ms = PING_INTERVAL_MS;
+static atomic_t ping_now = ATOMIC_INIT(0);
 
 #define PING_RESYNC_MIN_INTERVAL_MS 500
+#define WIRELESS_STANDBY_PING_INTERVAL_MS 3000
 
 LOG_MODULE_REGISTER(connection, LOG_LEVEL_INF);
 
@@ -117,6 +120,12 @@ static bool no_ack = false;
 uint32_t get_ping_interval_ms(void)
 {
 	return ping_interval_ms + esb_get_ping_backoff_ms();
+}
+
+void connection_request_ping_now(void)
+{
+	atomic_set(&ping_now, 1);
+	k_sem_give(&connection_wake_sem);
 }
 
 static void connection_signal_wake(void);
@@ -1171,6 +1180,20 @@ static void connection_signal_wake(void)
 	k_sem_give(&connection_wake_sem);
 }
 
+static void connection_write_ping(int64_t now)
+{
+	uint8_t ping[ESB_PING_LEN] = {0};
+	ping[0] = ESB_PING_TYPE;
+	ping[1] = connection_get_id();
+	ping[2] = 0;
+	memset(&ping[3], 0x00, 4);
+	ping[7] = esb_get_ping_ack_flag();
+	memset(&ping[8], 0x00, 4);
+	ping[ESB_PING_LEN - 1] = 0;
+	esb_write(ping, false, ESB_PING_LEN);
+	last_ping_time = now;
+}
+
 static int64_t connection_next_deadline_ms(int64_t now)
 {
 	int64_t deadline = now + 1000; /* bounded fallback */
@@ -1241,6 +1264,22 @@ void connection_thread(void)
 		watchdog_feed(WDT_CHANNEL_CONNECTION);
 		bool radio_ready = esb_ready();
 		bool hid_ready = connection_hid_output_ready();
+		bool wireless_standby = sys_wireless_standby_active();
+
+		if (wireless_standby) {
+			bool force_ping = atomic_cas(&ping_now, 1, 0);
+			if (radio_ready && (force_ping || now - last_ping_time >= WIRELESS_STANDBY_PING_INTERVAL_MS)) {
+				connection_write_ping(now);
+				continue;
+			}
+
+			int64_t wait_ms = WIRELESS_STANDBY_PING_INTERVAL_MS - (now - last_ping_time);
+			if (wait_ms < 1 || wait_ms > WIRELESS_STANDBY_PING_INTERVAL_MS) {
+				wait_ms = WIRELESS_STANDBY_PING_INTERVAL_MS;
+			}
+			(void)k_sem_take(&connection_wake_sem, K_MSEC(wait_ms));
+			continue;
+		}
 
 		/* Adaptive PING interval based on connection health */
 		if (get_status(SYS_STATUS_CONNECTION_ERROR)) {
@@ -1285,16 +1324,7 @@ void connection_thread(void)
 			}
 #endif
 			if (ping_due) {
-				uint8_t ping[ESB_PING_LEN] = {0};
-				ping[0] = ESB_PING_TYPE;
-				ping[1] = connection_get_id();
-				ping[2] = 0;
-				memset(&ping[3], 0x00, 4);
-				ping[7] = esb_get_ping_ack_flag();
-				memset(&ping[8], 0x00, 4);
-				ping[ESB_PING_LEN - 1] = 0;
-				esb_write(ping, false, ESB_PING_LEN);
-				last_ping_time = now;
+				connection_write_ping(now);
 				// k_usleep(400);
 				continue;
 			}

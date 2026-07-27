@@ -26,6 +26,8 @@
 #include <stdint.h>
 
 uint32_t get_ping_interval_ms(void);
+/* Request an immediate PING, used to acknowledge a wireless-standby WAKE. */
+void connection_request_ping_now(void);
 void connection_clocks_request_start(void);
 void connection_clocks_request_start_delay_us(uint32_t delay_us);
 void connection_clocks_request_stop(void);
